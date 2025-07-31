@@ -7,11 +7,11 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings" // Added for JWT header parsing
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5" // New import for JWT
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
@@ -32,11 +32,11 @@ type User struct {
 	ID           string         `json:"id" db:"id"`
 	Username     string         `json:"username" binding:"required" db:"username"`
 	Email        string         `json:"email" binding:"required,email" db:"email"`
-	PasswordHash string         `json:"passwordHash" binding:"required" db:"password_hash"` // Expect raw password in JSON for input
+	PasswordHash string         `json:"passwordHash" binding:"required" db:"password_hash"`
 	FirstName    string         `json:"firstName,omitempty" db:"first_name"`
 	LastName     string         `json:"lastName,omitempty" db:"last_name"`
-	Address      *Address       `json:"address,omitempty"`          // Address fields are flattened in DB, handled separately
-	Roles        pq.StringArray `json:"roles,omitempty" db:"roles"` // Changed to pq.StringArray to handle NULL
+	Address      *Address       `json:"address,omitempty"`
+	Roles        pq.StringArray `json:"roles,omitempty" db:"roles"`
 	// Fields for Address struct, directly mapped for scanning with sqlx
 	AddressStreet  sql.NullString `json:"-" db:"address_street"`
 	AddressCity    sql.NullString `json:"-" db:"address_city"`
@@ -53,7 +53,7 @@ type UserResponse struct {
 	FirstName string   `json:"firstName,omitempty"`
 	LastName  string   `json:"lastName,omitempty"`
 	Address   *Address `json:"address,omitempty"`
-	Roles     []string `json:"roles,omitempty"` // Keep as []string for JSON response
+	Roles     []string `json:"roles,omitempty"`
 }
 
 // LoginRequest struct for handling login requests
@@ -66,7 +66,7 @@ type LoginRequest struct {
 type Claims struct {
 	UserID   string   `json:"user_id"`
 	Username string   `json:"username"`
-	Roles    []string `json:"roles"` // Keep as []string for JWT
+	Roles    []string `json:"roles"`
 	jwt.RegisteredClaims
 }
 
@@ -74,9 +74,10 @@ type Claims struct {
 type UserRepository interface {
 	GetAllUsers() ([]UserResponse, error)
 	GetUserByID(id string) (*UserResponse, error)
-	GetUserByUsername(username string) (*User, error) // New method for login
+	GetUserByUsername(username string) (*User, error)
 	CreateUser(user User) (*UserResponse, error)
-	// Add other methods like UpdateUser, DeleteUser as needed
+	// New method for deleting a user
+	DeleteUser(id string) error
 }
 
 // PostgresUserRepository implements UserRepository for PostgreSQL
@@ -173,6 +174,23 @@ func (repo *PostgresUserRepository) CreateUser(user User) (*UserResponse, error)
 
 	userResp := convertToUserResponse(user)
 	return &userResp, nil
+}
+
+// DeleteUser removes a user from the database
+func (repo *PostgresUserRepository) DeleteUser(id string) error {
+	result, err := repo.db.Exec(`DELETE FROM users WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("error deleting user: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("error checking rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return errors.New("user not found")
+	}
+	return nil
 }
 
 // convertToUserResponse converts a User to UserResponse, omitting sensitive fields
@@ -278,6 +296,35 @@ func jwtAuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
 	}
 }
 
+// hasRole is a helper function to check if the user has a specific role
+func hasRole(c *gin.Context, requiredRole string) bool {
+	roles, exists := c.Get("roles")
+	if !exists {
+		return false
+	}
+	userRoles, ok := roles.([]string)
+	if !ok {
+		return false
+	}
+	for _, role := range userRoles {
+		if role == requiredRole {
+			return true
+		}
+	}
+	return false
+}
+
+// RBAC middleware to check for a specific role
+func requireRole(role string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !hasRole(c, role) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "You do not have the required permissions"})
+			return
+		}
+		c.Next()
+	}
+}
+
 func main() {
 	// Get database credentials
 	dbUser, dbPassword, err := getDBCredentials()
@@ -347,6 +394,10 @@ func main() {
 		if newUser.PasswordHash == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"message": "Password is required"})
 			return
+		}
+		// A newly created user should have a default role, e.g., "customer"
+		if len(newUser.Roles) == 0 {
+			newUser.Roles = []string{"customer"}
 		}
 
 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newUser.PasswordHash), bcrypt.DefaultCost)
@@ -419,7 +470,8 @@ func main() {
 	protected := router.Group("/")
 	protected.Use(jwtAuthMiddleware([]byte(jwtSecret)))
 	{
-		protected.GET("/users", func(c *gin.Context) { // Changed from router.GET to protected.GET
+		// GET /users: Only accessible by "admin" role
+		protected.GET("/users", requireRole("admin"), func(c *gin.Context) {
 			users, err := userRepo.GetAllUsers()
 			if err != nil {
 				log.Printf("Error getting all users: %v", err)
@@ -429,8 +481,16 @@ func main() {
 			c.JSON(http.StatusOK, users)
 		})
 
-		protected.GET("/users/:id", func(c *gin.Context) { // Changed from router.GET to protected.GET
+		// GET /users/:id: Accessible by "admin" or the user themselves
+		protected.GET("/users/:id", func(c *gin.Context) {
 			id := c.Param("id")
+			// Check if the authenticated user is the one being requested
+			authenticatedUserID, _ := c.Get("userID")
+			if authenticatedUserID != id && !hasRole(c, "admin") {
+				c.JSON(http.StatusForbidden, gin.H{"error": "You can only view your own user profile unless you are an admin"})
+				return
+			}
+
 			user, err := userRepo.GetUserByID(id)
 			if err != nil {
 				log.Printf("Error getting user by ID %s: %v", id, err)
@@ -442,6 +502,23 @@ func main() {
 				return
 			}
 			c.JSON(http.StatusOK, user)
+		})
+
+		// DELETE /users/:id: Only accessible by "admin" role
+		protected.DELETE("/users/:id", requireRole("admin"), func(c *gin.Context) {
+			id := c.Param("id")
+
+			err := userRepo.DeleteUser(id)
+			if err != nil {
+				if err.Error() == "user not found" {
+					c.JSON(http.StatusNotFound, gin.H{"message": "User not found"})
+					return
+				}
+				log.Printf("Error deleting user by ID %s: %v", id, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete user"})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"message": "User deleted successfully"})
 		})
 	}
 
