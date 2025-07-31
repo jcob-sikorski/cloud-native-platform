@@ -7,36 +7,45 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings" // Added for JWT header parsing
+	"time"
 
-	// Keep strings import for potential future use, though not strictly needed for this change
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5" // New import for JWT
 	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
 
 // Address represents a user's address details
 type Address struct {
-	Street  string `json:"street"`
-	City    string `json:"city"`
-	State   string `json:"state"`
-	ZipCode string `json:"zipCode"`
-	Country string `json:"country"`
+	Street  string `json:"street" db:"address_street"`
+	City    string `json:"city" db:"address_city"`
+	State   string `json:"state" db:"address_state"`
+	ZipCode string `json:"zipCode" db:"address_zip_code"`
+	Country string `json:"country" db:"address_country"`
 }
 
 // User represents a user model for the e-commerce platform
 type User struct {
-	ID           string   `json:"id"`
-	Username     string   `json:"username" binding:"required"`
-	Email        string   `json:"email" binding:"required,email"`
-	PasswordHash string   `json:"passwordHash" binding:"required"` // Expect raw password in JSON
-	FirstName    string   `json:"firstName,omitempty"`
-	LastName     string   `json:"lastName,omitempty"`
-	Address      *Address `json:"address,omitempty"`
-	Roles        []string `json:"roles,omitempty"`
+	ID           string         `json:"id" db:"id"`
+	Username     string         `json:"username" binding:"required" db:"username"`
+	Email        string         `json:"email" binding:"required,email" db:"email"`
+	PasswordHash string         `json:"passwordHash" binding:"required" db:"password_hash"` // Expect raw password in JSON for input
+	FirstName    string         `json:"firstName,omitempty" db:"first_name"`
+	LastName     string         `json:"lastName,omitempty" db:"last_name"`
+	Address      *Address       `json:"address,omitempty"`          // Address fields are flattened in DB, handled separately
+	Roles        pq.StringArray `json:"roles,omitempty" db:"roles"` // Changed to pq.StringArray to handle NULL
+	// Fields for Address struct, directly mapped for scanning with sqlx
+	AddressStreet  sql.NullString `json:"-" db:"address_street"`
+	AddressCity    sql.NullString `json:"-" db:"address_city"`
+	AddressState   sql.NullString `json:"-" db:"address_state"`
+	AddressZipCode sql.NullString `json:"-" db:"address_zip_code"`
+	AddressCountry sql.NullString `json:"-" db:"address_country"`
 }
 
-// UserResponse is a simplified struct for API responses
+// UserResponse is a simplified struct for API responses, omitting sensitive fields
 type UserResponse struct {
 	ID        string   `json:"id"`
 	Username  string   `json:"username"`
@@ -44,25 +53,149 @@ type UserResponse struct {
 	FirstName string   `json:"firstName,omitempty"`
 	LastName  string   `json:"lastName,omitempty"`
 	Address   *Address `json:"address,omitempty"`
-	Roles     []string `json:"roles,omitempty"`
+	Roles     []string `json:"roles,omitempty"` // Keep as []string for JSON response
 }
 
-// Request types for channel communication
-type getUsersRequest struct {
-	response chan []UserResponse
+// LoginRequest struct for handling login requests
+type LoginRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
 }
 
-type getUserByIDRequest struct {
-	id       string
-	response chan *UserResponse
+// Claims defines the JWT claims structure
+type Claims struct {
+	UserID   string   `json:"user_id"`
+	Username string   `json:"username"`
+	Roles    []string `json:"roles"` // Keep as []string for JWT
+	jwt.RegisteredClaims
 }
 
-type createUserRequest struct {
-	user     User
-	response chan struct {
-		user *UserResponse
-		err  error
+// UserRepository defines the interface for user data operations
+type UserRepository interface {
+	GetAllUsers() ([]UserResponse, error)
+	GetUserByID(id string) (*UserResponse, error)
+	GetUserByUsername(username string) (*User, error) // New method for login
+	CreateUser(user User) (*UserResponse, error)
+	// Add other methods like UpdateUser, DeleteUser as needed
+}
+
+// PostgresUserRepository implements UserRepository for PostgreSQL
+type PostgresUserRepository struct {
+	db *sqlx.DB
+}
+
+// NewPostgresUserRepository creates a new instance of PostgresUserRepository
+func NewPostgresUserRepository(db *sqlx.DB) *PostgresUserRepository {
+	return &PostgresUserRepository{db: db}
+}
+
+// GetAllUsers retrieves all users from the database
+func (repo *PostgresUserRepository) GetAllUsers() ([]UserResponse, error) {
+	var users []User
+	err := repo.db.Select(&users, `
+		SELECT id, username, email, password_hash, first_name, last_name,
+			   address_street, address_city, address_state, address_zip_code, address_country, roles
+		FROM users`)
+	if err != nil {
+		return nil, fmt.Errorf("error querying users: %w", err)
 	}
+
+	var userResponses []UserResponse
+	for _, u := range users {
+		userResponses = append(userResponses, convertToUserResponse(u))
+	}
+	return userResponses, nil
+}
+
+// GetUserByID retrieves a user by their ID from the database
+func (repo *PostgresUserRepository) GetUserByID(id string) (*UserResponse, error) {
+	var u User
+	err := repo.db.Get(&u, `
+		SELECT id, username, email, password_hash, first_name, last_name,
+			   address_street, address_city, address_state, address_zip_code, address_country, roles
+		FROM users WHERE id = $1`, id)
+	if err == sql.ErrNoRows {
+		return nil, nil // User not found
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error querying user by ID: %w", err)
+	}
+
+	userResp := convertToUserResponse(u)
+	return &userResp, nil
+}
+
+// GetUserByUsername retrieves a user by their username (used for login)
+func (repo *PostgresUserRepository) GetUserByUsername(username string) (*User, error) {
+	var u User
+	err := repo.db.Get(&u, `
+		SELECT id, username, email, password_hash, first_name, last_name,
+			   address_street, address_city, address_state, address_zip_code, address_country, roles
+		FROM users WHERE username = $1`, username)
+	if err == sql.ErrNoRows {
+		return nil, nil // User not found
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error querying user by username: %w", err)
+	}
+	return &u, nil
+}
+
+// CreateUser inserts a new user into the database
+func (repo *PostgresUserRepository) CreateUser(user User) (*UserResponse, error) {
+	if user.Username == "" || user.Email == "" {
+		return nil, errors.New("username and email are required")
+	}
+
+	user.ID = uuid.New().String()
+
+	var street, city, state, zipCode, country sql.NullString
+	if user.Address != nil {
+		street = sql.NullString{String: user.Address.Street, Valid: user.Address.Street != ""}
+		city = sql.NullString{String: user.Address.City, Valid: user.Address.City != ""}
+		state = sql.NullString{String: user.Address.State, Valid: user.Address.State != ""}
+		zipCode = sql.NullString{String: user.Address.ZipCode, Valid: user.Address.ZipCode != ""}
+		country = sql.NullString{String: user.Address.Country, Valid: user.Address.Country != ""}
+	}
+
+	_, err := repo.db.Exec(`
+		INSERT INTO users (id, username, email, password_hash, first_name, last_name,
+						  address_street, address_city, address_state, address_zip_code, address_country, roles)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+		user.ID, user.Username, user.Email, user.PasswordHash,
+		user.FirstName, user.LastName, street, city, state, zipCode, country, pq.Array(user.Roles))
+	if err != nil {
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code.Name() == "unique_violation" {
+			return nil, fmt.Errorf("user with this username or email already exists: %w", err)
+		}
+		return nil, fmt.Errorf("error creating user: %w", err)
+	}
+
+	userResp := convertToUserResponse(user)
+	return &userResp, nil
+}
+
+// convertToUserResponse converts a User to UserResponse, omitting sensitive fields
+func convertToUserResponse(user User) UserResponse {
+	resp := UserResponse{
+		ID:        user.ID,
+		Username:  user.Username,
+		Email:     user.Email,
+		FirstName: user.FirstName,
+		LastName:  user.LastName,
+		Roles:     []string(user.Roles), // Convert pq.StringArray to []string
+	}
+
+	if user.AddressStreet.Valid || user.AddressCity.Valid || user.AddressState.Valid || user.AddressZipCode.Valid || user.AddressCountry.Valid {
+		resp.Address = &Address{
+			Street:  user.AddressStreet.String,
+			City:    user.AddressCity.String,
+			State:   user.AddressState.String,
+			ZipCode: user.AddressZipCode.String,
+			Country: user.AddressCountry.String,
+		}
+	}
+	return resp
 }
 
 // getDBCredentials now directly reads from environment variables
@@ -80,6 +213,71 @@ func getDBCredentials() (string, string, error) {
 	return dbUser, dbPassword, nil
 }
 
+// connectDB attempts to connect to the database with retries
+func connectDB(dbURL string) (*sqlx.DB, error) {
+	var db *sqlx.DB
+	var err error
+	maxRetries := 10
+	for i := 0; i < maxRetries; i++ {
+		db, err = sqlx.Connect("postgres", dbURL)
+		if err == nil {
+			log.Println("Successfully connected to database")
+			return db, nil
+		}
+		log.Printf("Failed to connect to database (attempt %d/%d): %v", i+1, maxRetries, err)
+		time.Sleep(5 * time.Second) // Wait before retrying
+	}
+	return nil, fmt.Errorf("failed to connect to database after %d retries: %w", maxRetries, err)
+}
+
+// jwtAuthMiddleware validates JWTs from the Authorization header
+func jwtAuthMiddleware(jwtSecret []byte) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
+			return
+		}
+
+		parts := strings.Split(authHeader, " ")
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header must be in format 'Bearer <token>'"})
+			return
+		}
+
+		tokenString := parts[1]
+
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return jwtSecret, nil
+		})
+
+		if err != nil {
+			log.Printf("JWT parsing error: %v", err)
+			if errors.Is(err, jwt.ErrTokenExpired) {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Token expired"})
+			} else {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			}
+			return
+		}
+
+		if !token.Valid {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			return
+		}
+
+		// Store claims in context for subsequent handlers
+		c.Set("userID", claims.UserID)
+		c.Set("username", claims.Username)
+		c.Set("roles", claims.Roles)
+		c.Next() // Continue to the next handler
+	}
+}
+
 func main() {
 	// Get database credentials
 	dbUser, dbPassword, err := getDBCredentials()
@@ -90,7 +288,7 @@ func main() {
 	// Get other database connection parameters
 	dbHost := os.Getenv("DB_HOST")
 	if dbHost == "" {
-		dbHost = "postgres" // Default to service name in Docker Compose
+		dbHost = "postgres" // Default to service name in Docker Compose/Kubernetes
 	}
 
 	dbPort := os.Getenv("DB_PORT")
@@ -98,58 +296,48 @@ func main() {
 		dbPort = "5432" // Default PostgreSQL port
 	}
 
-	dbName := os.Getenv("POSTGRES_DB") // Changed from DB_NAME to POSTGRES_DB
+	dbName := os.Getenv("POSTGRES_DB")
 	if dbName == "" {
 		dbName = "user_service" // Default database name
+	}
+
+	// Get JWT Secret Key from environment variable
+	jwtSecret := os.Getenv("JWT_SECRET_KEY")
+	if jwtSecret == "" {
+		log.Fatal("JWT_SECRET_KEY environment variable is required")
 	}
 
 	// Construct database URL
 	dbURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
 		dbUser, dbPassword, dbHost, dbPort, dbName)
 
-	// Connect to PostgreSQL
-	db, err := sql.Open("postgres", dbURL)
+	// Connect to PostgreSQL with retries
+	db, err := connectDB(dbURL)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("Failed to establish database connection: %v", err)
 	}
 	defer db.Close()
 
-	// Test database connection
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping database: %v", err)
-	}
-
-	log.Println("Successfully connected to database")
-
-	// Create channels for communication with the user manager
-	getUsersChan := make(chan getUsersRequest)
-	getUserByIDChan := make(chan getUserByIDRequest)
-	createUserChan := make(chan createUserRequest)
-
-	// Start the user manager goroutine
-	go userManager(db, getUsersChan, getUserByIDChan, createUserChan)
+	// Initialize the user repository
+	userRepo := NewPostgresUserRepository(db)
 
 	router := gin.Default()
 
-	// Define routes
-	router.GET("/users", func(c *gin.Context) {
-		respChan := make(chan []UserResponse)
-		getUsersChan <- getUsersRequest{response: respChan}
-		users := <-respChan
-		c.JSON(http.StatusOK, users)
+	// Add health and readiness endpoints for Kubernetes probes
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "UP"})
 	})
 
-	router.GET("/users/:id", func(c *gin.Context) {
-		respChan := make(chan *UserResponse)
-		getUserByIDChan <- getUserByIDRequest{id: c.Param("id"), response: respChan}
-		user := <-respChan
-		if user == nil {
-			c.JSON(http.StatusNotFound, gin.H{"message": "User not found"})
+	router.GET("/ready", func(c *gin.Context) {
+		if err := db.Ping(); err != nil {
+			log.Printf("Readiness probe failed: database connection error: %v", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "DOWN", "reason": "database not ready"})
 			return
 		}
-		c.JSON(http.StatusOK, user)
+		c.JSON(http.StatusOK, gin.H{"status": "READY"})
 	})
 
+	// Public route for user creation
 	router.POST("/users", func(c *gin.Context) {
 		var newUser User
 		if err := c.ShouldBindJSON(&newUser); err != nil {
@@ -161,7 +349,6 @@ func main() {
 			return
 		}
 
-		// Hash the password using bcrypt
 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newUser.PasswordHash), bcrypt.DefaultCost)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
@@ -169,164 +356,99 @@ func main() {
 		}
 		newUser.PasswordHash = string(hashedPassword)
 
-		// Send the user creation request to the userManager
-		respChan := make(chan struct {
-			user *UserResponse
-			err  error
-		})
-		createUserChan <- createUserRequest{user: newUser, response: respChan}
-		resp := <-respChan
-		if resp.err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": resp.err.Error()})
+		userResp, err := userRepo.CreateUser(newUser)
+		if err != nil {
+			log.Printf("Error creating user: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		c.JSON(http.StatusCreated, resp.user)
+		c.JSON(http.StatusCreated, userResp)
 	})
+
+	// New login endpoint
+	router.POST("/login", func(c *gin.Context) {
+		var req LoginRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		user, err := userRepo.GetUserByUsername(req.Username)
+		if err != nil {
+			log.Printf("Error retrieving user for login: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+			return
+		}
+		if user == nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+			return
+		}
+
+		// Compare the provided password with the hashed password
+		err = bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password))
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+			return
+		}
+
+		// Generate JWT
+		expirationTime := time.Now().Add(24 * time.Hour) // Token valid for 24 hours
+		claims := &Claims{
+			UserID:   user.ID,
+			Username: user.Username,
+			Roles:    user.Roles,
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(expirationTime),
+				IssuedAt:  jwt.NewNumericDate(time.Now()),
+				NotBefore: jwt.NewNumericDate(time.Now()),
+			},
+		}
+
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		tokenString, err := token.SignedString([]byte(jwtSecret))
+		if err != nil {
+			log.Printf("Error signing token: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"token": tokenString})
+	})
+
+	// Apply JWT authentication middleware to protected routes
+	protected := router.Group("/")
+	protected.Use(jwtAuthMiddleware([]byte(jwtSecret)))
+	{
+		protected.GET("/users", func(c *gin.Context) { // Changed from router.GET to protected.GET
+			users, err := userRepo.GetAllUsers()
+			if err != nil {
+				log.Printf("Error getting all users: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve users"})
+				return
+			}
+			c.JSON(http.StatusOK, users)
+		})
+
+		protected.GET("/users/:id", func(c *gin.Context) { // Changed from router.GET to protected.GET
+			id := c.Param("id")
+			user, err := userRepo.GetUserByID(id)
+			if err != nil {
+				log.Printf("Error getting user by ID %s: %v", id, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve user"})
+				return
+			}
+			if user == nil {
+				c.JSON(http.StatusNotFound, gin.H{"message": "User not found"})
+				return
+			}
+			c.JSON(http.StatusOK, user)
+		})
+	}
 
 	// Run the server
 	port := "8080"
 	log.Printf("User Service starting on port %s", port)
 	if err := router.Run(":" + port); err != nil {
 		log.Fatalf("Failed to run server: %v", err)
-	}
-}
-
-// userManager handles all database operations in a single goroutine
-func userManager(db *sql.DB, getUsersChan <-chan getUsersRequest, getUserByIDChan <-chan getUserByIDRequest, createUserChan <-chan createUserRequest) {
-	for {
-		select {
-		case req := <-getUsersChan:
-			go func(req getUsersRequest) {
-				rows, err := db.Query(`
-					SELECT id, username, email, first_name, last_name,
-						   address_street, address_city, address_state, address_zip_code, address_country, roles
-					FROM users`)
-				if err != nil {
-					log.Printf("Error querying users: %v", err)
-					req.response <- nil
-					return
-				}
-				defer rows.Close()
-
-				var userResponses []UserResponse
-				for rows.Next() {
-					var u User
-					var street, city, state, zipCode, country sql.NullString
-					var dbRoles pq.StringArray
-
-					if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.FirstName, &u.LastName,
-						&street, &city, &state, &zipCode, &country, &dbRoles); err != nil {
-						log.Printf("Error scanning user: %v", err)
-						continue
-					}
-					u.Roles = []string(dbRoles)
-
-					if street.Valid || city.Valid || state.Valid || zipCode.Valid || country.Valid {
-						u.Address = &Address{
-							Street:  street.String,
-							City:    city.String,
-							State:   state.String,
-							ZipCode: zipCode.String,
-							Country: country.String,
-						}
-					}
-					userResponses = append(userResponses, convertToUserResponse(u))
-				}
-				req.response <- userResponses
-			}(req)
-
-		case req := <-getUserByIDChan:
-			go func(req getUserByIDRequest) {
-				var u User
-				var street, city, state, zipCode, country sql.NullString
-				var dbRoles pq.StringArray
-
-				err := db.QueryRow(`
-					SELECT id, username, email, first_name, last_name,
-						   address_street, address_city, address_state, address_zip_code, address_country, roles
-					FROM users WHERE id = $1`, req.id).
-					Scan(&u.ID, &u.Username, &u.Email, &u.FirstName, &u.LastName,
-						&street, &city, &state, &zipCode, &country, &dbRoles)
-				if err == sql.ErrNoRows {
-					req.response <- nil
-					return
-				}
-				if err != nil {
-					log.Printf("Error querying user by ID: %v", err)
-					req.response <- nil
-					return
-				}
-				u.Roles = []string(dbRoles)
-
-				if street.Valid || city.Valid || state.Valid || zipCode.Valid || country.Valid {
-					u.Address = &Address{
-						Street:  street.String,
-						City:    city.String,
-						State:   state.String,
-						ZipCode: zipCode.String,
-						Country: country.String,
-					}
-				}
-				userResp := convertToUserResponse(u)
-				req.response <- &userResp
-			}(req)
-
-		case req := <-createUserChan:
-			go func(req createUserRequest) {
-				if req.user.Username == "" || req.user.Email == "" {
-					req.response <- struct {
-						user *UserResponse
-						err  error
-					}{nil, errors.New("username and email are required")}
-					return
-				}
-
-				newUser := req.user
-				newUser.ID = uuid.New().String()
-
-				var street, city, state, zipCode, country string
-				if newUser.Address != nil {
-					street = newUser.Address.Street
-					city = newUser.Address.City
-					state = newUser.Address.State
-					zipCode = newUser.Address.ZipCode
-					country = newUser.Address.Country
-				}
-
-				_, err := db.Exec(`
-					INSERT INTO users (id, username, email, password_hash, first_name, last_name,
-									  address_street, address_city, address_state, address_zip_code, address_country, roles)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-					newUser.ID, newUser.Username, newUser.Email, newUser.PasswordHash,
-					newUser.FirstName, newUser.LastName, street, city, state, zipCode, country, pq.Array(newUser.Roles))
-				if err != nil {
-					log.Printf("Error creating user: %v", err)
-					req.response <- struct {
-						user *UserResponse
-						err  error
-					}{nil, err}
-					return
-				}
-
-				userResp := convertToUserResponse(newUser)
-				req.response <- struct {
-					user *UserResponse
-					err  error
-				}{user: &userResp, err: nil}
-			}(req)
-		}
-	}
-}
-
-// convertToUserResponse converts a User to UserResponse, omitting sensitive fields
-func convertToUserResponse(user User) UserResponse {
-	return UserResponse{
-		ID:        user.ID,
-		Username:  user.Username,
-		Email:     user.Email,
-		FirstName: user.FirstName,
-		LastName:  user.LastName,
-		Address:   user.Address,
-		Roles:     user.Roles,
 	}
 }
