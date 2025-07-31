@@ -62,6 +62,17 @@ type LoginRequest struct {
 	Password string `json:"password" binding:"required"`
 }
 
+// RefreshRequest struct for handling refresh token requests
+type RefreshRequest struct {
+	RefreshToken string `json:"refreshToken" binding:"required"`
+}
+
+// TokenResponse struct for sending back access and refresh tokens
+type TokenResponse struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+}
+
 // Claims defines the JWT claims structure
 type Claims struct {
 	UserID   string   `json:"user_id"`
@@ -70,14 +81,30 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
+// RefreshToken represents a refresh token stored in the database
+type RefreshToken struct {
+	Token     string    `db:"token"`
+	UserID    string    `db:"user_id"`
+	ExpiresAt time.Time `db:"expires_at"`
+	CreatedAt time.Time `db:"created_at"`
+	IsRevoked bool      `db:"is_revoked"`
+}
+
 // UserRepository defines the interface for user data operations
 type UserRepository interface {
 	GetAllUsers() ([]UserResponse, error)
 	GetUserByID(id string) (*UserResponse, error)
 	GetUserByUsername(username string) (*User, error)
 	CreateUser(user User) (*UserResponse, error)
-	// New method for deleting a user
 	DeleteUser(id string) error
+}
+
+// RefreshTokenRepository defines the interface for refresh token data operations
+type RefreshTokenRepository interface {
+	CreateToken(token RefreshToken) error
+	GetToken(tokenString string) (*RefreshToken, error)
+	RevokeToken(tokenString string) error
+	RevokeAllUserTokens(userID string) error
 }
 
 // PostgresUserRepository implements UserRepository for PostgreSQL
@@ -94,9 +121,9 @@ func NewPostgresUserRepository(db *sqlx.DB) *PostgresUserRepository {
 func (repo *PostgresUserRepository) GetAllUsers() ([]UserResponse, error) {
 	var users []User
 	err := repo.db.Select(&users, `
-		SELECT id, username, email, password_hash, first_name, last_name,
-			   address_street, address_city, address_state, address_zip_code, address_country, roles
-		FROM users`)
+        SELECT id, username, email, password_hash, first_name, last_name,
+               address_street, address_city, address_state, address_zip_code, address_country, roles
+        FROM users`)
 	if err != nil {
 		return nil, fmt.Errorf("error querying users: %w", err)
 	}
@@ -112,9 +139,9 @@ func (repo *PostgresUserRepository) GetAllUsers() ([]UserResponse, error) {
 func (repo *PostgresUserRepository) GetUserByID(id string) (*UserResponse, error) {
 	var u User
 	err := repo.db.Get(&u, `
-		SELECT id, username, email, password_hash, first_name, last_name,
-			   address_street, address_city, address_state, address_zip_code, address_country, roles
-		FROM users WHERE id = $1`, id)
+        SELECT id, username, email, password_hash, first_name, last_name,
+               address_street, address_city, address_state, address_zip_code, address_country, roles
+        FROM users WHERE id = $1`, id)
 	if err == sql.ErrNoRows {
 		return nil, nil // User not found
 	}
@@ -130,9 +157,9 @@ func (repo *PostgresUserRepository) GetUserByID(id string) (*UserResponse, error
 func (repo *PostgresUserRepository) GetUserByUsername(username string) (*User, error) {
 	var u User
 	err := repo.db.Get(&u, `
-		SELECT id, username, email, password_hash, first_name, last_name,
-			   address_street, address_city, address_state, address_zip_code, address_country, roles
-		FROM users WHERE username = $1`, username)
+        SELECT id, username, email, password_hash, first_name, last_name,
+               address_street, address_city, address_state, address_zip_code, address_country, roles
+        FROM users WHERE username = $1`, username)
 	if err == sql.ErrNoRows {
 		return nil, nil // User not found
 	}
@@ -160,9 +187,9 @@ func (repo *PostgresUserRepository) CreateUser(user User) (*UserResponse, error)
 	}
 
 	_, err := repo.db.Exec(`
-		INSERT INTO users (id, username, email, password_hash, first_name, last_name,
-						  address_street, address_city, address_state, address_zip_code, address_country, roles)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        INSERT INTO users (id, username, email, password_hash, first_name, last_name,
+                          address_street, address_city, address_state, address_zip_code, address_country, roles)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		user.ID, user.Username, user.Email, user.PasswordHash,
 		user.FirstName, user.LastName, street, city, state, zipCode, country, pq.Array(user.Roles))
 	if err != nil {
@@ -189,6 +216,59 @@ func (repo *PostgresUserRepository) DeleteUser(id string) error {
 	}
 	if rowsAffected == 0 {
 		return errors.New("user not found")
+	}
+	return nil
+}
+
+// PostgresRefreshTokenRepository implements RefreshTokenRepository for PostgreSQL
+type PostgresRefreshTokenRepository struct {
+	db *sqlx.DB
+}
+
+// NewPostgresRefreshTokenRepository creates a new instance of PostgresRefreshTokenRepository
+func NewPostgresRefreshTokenRepository(db *sqlx.DB) *PostgresRefreshTokenRepository {
+	return &PostgresRefreshTokenRepository{db: db}
+}
+
+// CreateToken inserts a new refresh token into the database
+func (repo *PostgresRefreshTokenRepository) CreateToken(token RefreshToken) error {
+	_, err := repo.db.Exec(`
+        INSERT INTO refresh_tokens (token, user_id, expires_at) VALUES ($1, $2, $3)`,
+		token.Token, token.UserID, token.ExpiresAt)
+	if err != nil {
+		return fmt.Errorf("error creating refresh token: %w", err)
+	}
+	return nil
+}
+
+// GetToken retrieves a refresh token from the database
+func (repo *PostgresRefreshTokenRepository) GetToken(tokenString string) (*RefreshToken, error) {
+	var rt RefreshToken
+	err := repo.db.Get(&rt, `
+        SELECT token, user_id, expires_at, is_revoked FROM refresh_tokens WHERE token = $1`, tokenString)
+	if err == sql.ErrNoRows {
+		return nil, nil // Token not found
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error querying refresh token: %w", err)
+	}
+	return &rt, nil
+}
+
+// RevokeToken marks a refresh token as revoked
+func (repo *PostgresRefreshTokenRepository) RevokeToken(tokenString string) error {
+	_, err := repo.db.Exec(`UPDATE refresh_tokens SET is_revoked = TRUE WHERE token = $1`, tokenString)
+	if err != nil {
+		return fmt.Errorf("error revoking refresh token: %w", err)
+	}
+	return nil
+}
+
+// RevokeAllUserTokens revokes all tokens for a specific user
+func (repo *PostgresRefreshTokenRepository) RevokeAllUserTokens(userID string) error {
+	_, err := repo.db.Exec(`UPDATE refresh_tokens SET is_revoked = TRUE WHERE user_id = $1`, userID)
+	if err != nil {
+		return fmt.Errorf("error revoking all user refresh tokens: %w", err)
 	}
 	return nil
 }
@@ -325,6 +405,45 @@ func requireRole(role string) gin.HandlerFunc {
 	}
 }
 
+// generateAccessToken generates a new JWT access token
+func generateAccessToken(user *User, jwtSecret []byte) (string, error) {
+	// Access token with a short lifespan (e.g., 15 minutes)
+	expirationTime := time.Now().Add(15 * time.Minute)
+	claims := &Claims{
+		UserID:   user.ID,
+		Username: user.Username,
+		Roles:    user.Roles,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(expirationTime),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			NotBefore: jwt.NewNumericDate(time.Now()),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtSecret)
+}
+
+// generateRefreshToken generates a new refresh token and stores it in the database
+func generateRefreshToken(user *User, repo RefreshTokenRepository) (string, error) {
+	// Refresh token with a long lifespan (e.g., 7 days)
+	tokenString := uuid.New().String()
+	expiresAt := time.Now().Add(7 * 24 * time.Hour)
+
+	refreshToken := RefreshToken{
+		Token:     tokenString,
+		UserID:    user.ID,
+		ExpiresAt: expiresAt,
+	}
+
+	err := repo.CreateToken(refreshToken)
+	if err != nil {
+		return "", fmt.Errorf("failed to save refresh token: %w", err)
+	}
+
+	return tokenString, nil
+}
+
 func main() {
 	// Get database credentials
 	dbUser, dbPassword, err := getDBCredentials()
@@ -365,8 +484,9 @@ func main() {
 	}
 	defer db.Close()
 
-	// Initialize the user repository
+	// Initialize the user and refresh token repositories
 	userRepo := NewPostgresUserRepository(db)
+	refreshTokenRepo := NewPostgresRefreshTokenRepository(db)
 
 	router := gin.Default()
 
@@ -416,7 +536,7 @@ func main() {
 		c.JSON(http.StatusCreated, userResp)
 	})
 
-	// New login endpoint
+	// New login endpoint with refresh token
 	router.POST("/login", func(c *gin.Context) {
 		var req LoginRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -442,28 +562,79 @@ func main() {
 			return
 		}
 
-		// Generate JWT
-		expirationTime := time.Now().Add(24 * time.Hour) // Token valid for 24 hours
-		claims := &Claims{
-			UserID:   user.ID,
-			Username: user.Username,
-			Roles:    user.Roles,
-			RegisteredClaims: jwt.RegisteredClaims{
-				ExpiresAt: jwt.NewNumericDate(expirationTime),
-				IssuedAt:  jwt.NewNumericDate(time.Now()),
-				NotBefore: jwt.NewNumericDate(time.Now()),
-			},
-		}
-
-		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-		tokenString, err := token.SignedString([]byte(jwtSecret))
+		// Generate Access Token
+		accessToken, err := generateAccessToken(user, []byte(jwtSecret))
 		if err != nil {
-			log.Printf("Error signing token: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+			log.Printf("Error generating access token: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate access token"})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{"token": tokenString})
+		// Generate and store Refresh Token
+		refreshToken, err := generateRefreshToken(user, refreshTokenRepo)
+		if err != nil {
+			log.Printf("Error generating refresh token: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate refresh token"})
+			return
+		}
+
+		c.JSON(http.StatusOK, TokenResponse{
+			AccessToken:  accessToken,
+			RefreshToken: refreshToken,
+		})
+	})
+
+	// New endpoint to refresh an access token
+	router.POST("/refresh", func(c *gin.Context) {
+		var req RefreshRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Refresh token is required"})
+			return
+		}
+
+		// Look up the refresh token in the database
+		rt, err := refreshTokenRepo.GetToken(req.RefreshToken)
+		if err != nil {
+			log.Printf("Error retrieving refresh token: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
+			return
+		}
+		if rt == nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid refresh token"})
+			return
+		}
+
+		// Check if the token is revoked or expired
+		if rt.IsRevoked || rt.ExpiresAt.Before(time.Now()) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Refresh token is expired or revoked"})
+			return
+		}
+
+		// Get the user associated with the token
+		userResp, err := userRepo.GetUserByID(rt.UserID)
+		if err != nil || userResp == nil {
+			log.Printf("User not found for refresh token: %v", err)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid refresh token (user not found)"})
+			return
+		}
+
+		// We need the full User struct to get the password hash
+		user, err := userRepo.GetUserByUsername(userResp.Username)
+		if err != nil || user == nil {
+			log.Printf("User not found for refresh token: %v", err)
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid refresh token (user not found)"})
+			return
+		}
+
+		// Generate a new access token
+		newAccessToken, err := generateAccessToken(user, []byte(jwtSecret))
+		if err != nil {
+			log.Printf("Error generating new access token: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate new access token"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"accessToken": newAccessToken})
 	})
 
 	// Apply JWT authentication middleware to protected routes

@@ -18,6 +18,18 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
 CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
 
+-- Create the 'refresh_tokens' table to store refresh token data
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+    token VARCHAR(255) PRIMARY KEY,
+    user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_revoked BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- Optional: Add an index for faster lookups on user_id
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens (user_id);
+
 -- Optional: Add a default user for testing (only if the table is empty)
 -- This is useful for initial setup but might be removed in production
 DO $$
