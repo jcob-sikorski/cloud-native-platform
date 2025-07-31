@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // Address represents a user's address details
@@ -23,7 +24,7 @@ type User struct {
 	ID           string   `json:"id"`
 	Username     string   `json:"username" binding:"required"`
 	Email        string   `json:"email" binding:"required,email"`
-	PasswordHash string   `json:"-"` // Prevent marshaling/unmarshaling
+	PasswordHash string   `json:"passwordHash"`
 	FirstName    string   `json:"firstName,omitempty"`
 	LastName     string   `json:"lastName,omitempty"`
 	Address      *Address `json:"address,omitempty"`
@@ -136,6 +137,15 @@ func main() {
 			return
 		}
 
+		// Hash the password using bcrypt
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newUser.PasswordHash), bcrypt.DefaultCost)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+			return
+		}
+		newUser.PasswordHash = string(hashedPassword)
+
+		// Send the user creation request to the userManager
 		respChan := make(chan struct {
 			user *UserResponse
 			err  error
