@@ -4,8 +4,7 @@ FROM golang:1.24-alpine AS builder
 WORKDIR /app
 
 # Copy go.mod and go.sum first to leverage Docker cache
-COPY go.mod .
-COPY go.sum .
+COPY go.mod go.sum ./
 
 # Download all dependencies. Dependencies will be cached if the go.mod and go.sum files are unchanged
 RUN go mod download
@@ -23,13 +22,22 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o 
 # Stage 2: Create the final lightweight image
 FROM alpine:latest
 
-# Install ca-certificates for HTTPS communication
-RUN apk --no-cache add ca-certificates
+# Install ca-certificates for HTTPS communication and create non-root user
+RUN apk --no-cache add ca-certificates && \
+    addgroup -g 1001 -S appgroup && \
+    adduser -u 1001 -S appuser -G appgroup
 
-WORKDIR /root/
+WORKDIR /app
 
 # Copy the built binary from the builder stage
 COPY --from=builder /app/user-service .
+
+# Change ownership of the binary to the non-root user
+RUN chown appuser:appgroup user-service && \
+    chmod +x user-service
+
+# Switch to non-root user
+USER appuser
 
 # Expose the port the application listens on
 EXPOSE 8080

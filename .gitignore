@@ -1,0 +1,8 @@
+# Ignore .env
+.env
+
+# Go build cache
+/bin
+
+# Docker secrets folder
+/secrets/

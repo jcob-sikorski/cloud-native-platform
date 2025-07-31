@@ -1,12 +1,17 @@
 package main
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 
+	// Keep strings import for potential future use, though not strictly needed for this change
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -19,12 +24,12 @@ type Address struct {
 	Country string `json:"country"`
 }
 
-// User represents a more detailed user model for an e-commerce platform
+// User represents a user model for the e-commerce platform
 type User struct {
 	ID           string   `json:"id"`
 	Username     string   `json:"username" binding:"required"`
 	Email        string   `json:"email" binding:"required,email"`
-	PasswordHash string   `json:"passwordHash"`
+	PasswordHash string   `json:"passwordHash" binding:"required"` // Expect raw password in JSON
 	FirstName    string   `json:"firstName,omitempty"`
 	LastName     string   `json:"lastName,omitempty"`
 	Address      *Address `json:"address,omitempty"`
@@ -60,50 +65,69 @@ type createUserRequest struct {
 	}
 }
 
-// In-memory "database"
-var users = []User{
-	{
-		ID:           "1",
-		Username:     "john.doe",
-		Email:        "john.doe@example.com",
-		PasswordHash: "hashedpassword1",
-		FirstName:    "John",
-		LastName:     "Doe",
-		Address: &Address{
-			Street:  "123 Main St",
-			City:    "Anytown",
-			State:   "Anystate",
-			ZipCode: "12345",
-			Country: "USA",
-		},
-		Roles: []string{"customer"},
-	},
-	{
-		ID:           "2",
-		Username:     "jane.smith",
-		Email:        "jane.smith@example.com",
-		PasswordHash: "hashedpassword2",
-		FirstName:    "Jane",
-		LastName:     "Smith",
-		Address: &Address{
-			Street:  "456 Oak Ave",
-			City:    "Otherville",
-			State:   "Otherstate",
-			ZipCode: "67890",
-			Country: "USA",
-		},
-		Roles: []string{"customer", "admin"},
-	},
+// getDBCredentials now directly reads from environment variables
+func getDBCredentials() (string, string, error) {
+	dbUser := os.Getenv("POSTGRES_USER")
+	if dbUser == "" {
+		return "", "", errors.New("POSTGRES_USER environment variable is required")
+	}
+
+	dbPassword := os.Getenv("POSTGRES_PASSWORD")
+	if dbPassword == "" {
+		return "", "", errors.New("POSTGRES_PASSWORD environment variable is required")
+	}
+
+	return dbUser, dbPassword, nil
 }
 
 func main() {
-	// Create channels for communication with the user manager goroutine
+	// Get database credentials
+	dbUser, dbPassword, err := getDBCredentials()
+	if err != nil {
+		log.Fatalf("Failed to get database credentials: %v", err)
+	}
+
+	// Get other database connection parameters
+	dbHost := os.Getenv("DB_HOST")
+	if dbHost == "" {
+		dbHost = "postgres" // Default to service name in Docker Compose
+	}
+
+	dbPort := os.Getenv("DB_PORT")
+	if dbPort == "" {
+		dbPort = "5432" // Default PostgreSQL port
+	}
+
+	dbName := os.Getenv("POSTGRES_DB") // Changed from DB_NAME to POSTGRES_DB
+	if dbName == "" {
+		dbName = "user_service" // Default database name
+	}
+
+	// Construct database URL
+	dbURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		dbUser, dbPassword, dbHost, dbPort, dbName)
+
+	// Connect to PostgreSQL
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer db.Close()
+
+	// Test database connection
+	if err := db.Ping(); err != nil {
+		log.Fatalf("Failed to ping database: %v", err)
+	}
+
+	log.Println("Successfully connected to database")
+
+	// Create channels for communication with the user manager
 	getUsersChan := make(chan getUsersRequest)
 	getUserByIDChan := make(chan getUserByIDRequest)
 	createUserChan := make(chan createUserRequest)
 
 	// Start the user manager goroutine
-	go userManager(getUsersChan, getUserByIDChan, createUserChan)
+	go userManager(db, getUsersChan, getUserByIDChan, createUserChan)
 
 	router := gin.Default()
 
@@ -167,50 +191,129 @@ func main() {
 	}
 }
 
-// userManager handles all operations on the users slice in a single goroutine
-func userManager(getUsersChan <-chan getUsersRequest, getUserByIDChan <-chan getUserByIDRequest, createUserChan <-chan createUserRequest) {
+// userManager handles all database operations in a single goroutine
+func userManager(db *sql.DB, getUsersChan <-chan getUsersRequest, getUserByIDChan <-chan getUserByIDRequest, createUserChan <-chan createUserRequest) {
 	for {
 		select {
 		case req := <-getUsersChan:
-			var userResponses []UserResponse
-			for _, user := range users {
-				userResponses = append(userResponses, convertToUserResponse(user))
-			}
-			req.response <- userResponses
+			go func(req getUsersRequest) {
+				rows, err := db.Query(`
+					SELECT id, username, email, first_name, last_name,
+						   address_street, address_city, address_state, address_zip_code, address_country, roles
+					FROM users`)
+				if err != nil {
+					log.Printf("Error querying users: %v", err)
+					req.response <- nil
+					return
+				}
+				defer rows.Close()
+
+				var userResponses []UserResponse
+				for rows.Next() {
+					var u User
+					var street, city, state, zipCode, country sql.NullString
+					var dbRoles pq.StringArray
+
+					if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.FirstName, &u.LastName,
+						&street, &city, &state, &zipCode, &country, &dbRoles); err != nil {
+						log.Printf("Error scanning user: %v", err)
+						continue
+					}
+					u.Roles = []string(dbRoles)
+
+					if street.Valid || city.Valid || state.Valid || zipCode.Valid || country.Valid {
+						u.Address = &Address{
+							Street:  street.String,
+							City:    city.String,
+							State:   state.String,
+							ZipCode: zipCode.String,
+							Country: country.String,
+						}
+					}
+					userResponses = append(userResponses, convertToUserResponse(u))
+				}
+				req.response <- userResponses
+			}(req)
 
 		case req := <-getUserByIDChan:
-			var found bool
-			for _, user := range users {
-				if user.ID == req.id {
-					userResp := convertToUserResponse(user)
-					req.response <- &userResp
-					found = true
-					break
+			go func(req getUserByIDRequest) {
+				var u User
+				var street, city, state, zipCode, country sql.NullString
+				var dbRoles pq.StringArray
+
+				err := db.QueryRow(`
+					SELECT id, username, email, first_name, last_name,
+						   address_street, address_city, address_state, address_zip_code, address_country, roles
+					FROM users WHERE id = $1`, req.id).
+					Scan(&u.ID, &u.Username, &u.Email, &u.FirstName, &u.LastName,
+						&street, &city, &state, &zipCode, &country, &dbRoles)
+				if err == sql.ErrNoRows {
+					req.response <- nil
+					return
 				}
-			}
-			if !found {
-				req.response <- nil // User not found
-			}
+				if err != nil {
+					log.Printf("Error querying user by ID: %v", err)
+					req.response <- nil
+					return
+				}
+				u.Roles = []string(dbRoles)
+
+				if street.Valid || city.Valid || state.Valid || zipCode.Valid || country.Valid {
+					u.Address = &Address{
+						Street:  street.String,
+						City:    city.String,
+						State:   state.String,
+						ZipCode: zipCode.String,
+						Country: country.String,
+					}
+				}
+				userResp := convertToUserResponse(u)
+				req.response <- &userResp
+			}(req)
 
 		case req := <-createUserChan:
-			// Validate user (additional validation could be added here)
-			if req.user.Username == "" || req.user.Email == "" {
+			go func(req createUserRequest) {
+				if req.user.Username == "" || req.user.Email == "" {
+					req.response <- struct {
+						user *UserResponse
+						err  error
+					}{nil, errors.New("username and email are required")}
+					return
+				}
+
+				newUser := req.user
+				newUser.ID = uuid.New().String()
+
+				var street, city, state, zipCode, country string
+				if newUser.Address != nil {
+					street = newUser.Address.Street
+					city = newUser.Address.City
+					state = newUser.Address.State
+					zipCode = newUser.Address.ZipCode
+					country = newUser.Address.Country
+				}
+
+				_, err := db.Exec(`
+					INSERT INTO users (id, username, email, password_hash, first_name, last_name,
+									  address_street, address_city, address_state, address_zip_code, address_country, roles)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+					newUser.ID, newUser.Username, newUser.Email, newUser.PasswordHash,
+					newUser.FirstName, newUser.LastName, street, city, state, zipCode, country, pq.Array(newUser.Roles))
+				if err != nil {
+					log.Printf("Error creating user: %v", err)
+					req.response <- struct {
+						user *UserResponse
+						err  error
+					}{nil, err}
+					return
+				}
+
+				userResp := convertToUserResponse(newUser)
 				req.response <- struct {
 					user *UserResponse
 					err  error
-				}{nil, errors.New("username and email are required")}
-				continue
-			}
-
-			// Generate unique ID
-			newUser := req.user
-			newUser.ID = fmt.Sprintf("user-%d", len(users)+1)
-			users = append(users, newUser)
-			userResp := convertToUserResponse(newUser)
-			req.response <- struct {
-				user *UserResponse
-				err  error
-			}{user: &userResp, err: nil}
+				}{user: &userResp, err: nil}
+			}(req)
 		}
 	}
 }

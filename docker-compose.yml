@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: postgres-db
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./db/init.sh:/docker-entrypoint-initdb.d/init.sh
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  user-service:
+    build:
+      context: ./user-service
+      dockerfile: Dockerfile
+    container_name: user-service
+    # Load all environment variables from the .env file
+    env_file:
+      - .env
+    # Directly use the variables defined in .env
+    environment:
+      # These variables are now directly loaded from .env
+      # We will update main.go to read POSTGRES_USER and POSTGRES_PASSWORD directly
+      # instead of DB_USER_FILE/DB_PASSWORD_FILE or DB_USER/DB_PASSWORD
+      DB_HOST: ${DB_HOST} # Still explicitly define for clarity, though also in .env
+      DB_PORT: ${DB_PORT} # Still explicitly define for clarity, though also in .env
+      DB_NAME: ${POSTGRES_DB} # Still explicitly define for clarity, though also in .env
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+
+volumes:
+  postgres-data:
+
+networks:
+  app-network:
+    driver: bridge
