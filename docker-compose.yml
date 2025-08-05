@@ -1,3 +1,6 @@
+# docker-compose.yml
+# This file should be at the root of your project.
+
 services:
   postgres:
     image: postgres:16
@@ -6,12 +9,14 @@ services:
       - .env
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD} # Corrected typo: POSTES_PASSWORD -> POSTGRES_PASSWORD
     ports:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
-      - ./db/init.sh:/docker-entrypoint-initdb.d/init.sh
+      - ./db/init.sh:/docker-entry-point-initdb.d/init.sh
     networks:
       - app-network
     healthcheck:
@@ -23,26 +28,56 @@ services:
   user-service:
     build:
       context: ./user-service
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile
     container_name: user-service
-    # Load all environment variables from the .env file
     env_file:
       - .env
-    # Directly use the variables defined in .env
     environment:
-      # These variables are now directly loaded from .env
-      # We will update main.go to read POSTGRES_USER and POSTGRES_PASSWORD directly
-      # instead of DB_USER_FILE/DB_PASSWORD_FILE or DB_USER/DB_PASSWORD
-      DB_HOST: ${DB_HOST} # Still explicitly define for clarity, though also in .env
-      DB_PORT: ${DB_PORT} # Still explicitly define for clarity, though also in .env
-      DB_NAME: ${POSTGRES_DB} # Still explicitly define for clarity, though also in .env
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_NAME: ${POSTGRES_DB}
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      APP_PORT: ${APP_PORT}
+      JWT_SECRET: ${JWT_SECRET}
+      GIN_MODE: release
+      DB_SSLMODE: ${DB_SSLMODE}
+      LOG_LEVEL: debug
     ports:
-      - "8080:8080"
+      - "8080:${APP_PORT}"
     depends_on:
       postgres:
         condition: service_healthy
     networks:
       - app-network
+
+  # New service for running tests
+  test-runner:
+    image: golang:1.24-alpine # Use a Go image that matches your go.mod requirement
+    container_name: user-service-test-runner
+    working_dir: /app/user-service # Set working directory inside container
+    volumes:
+      - ./user-service:/app/user-service # Mount your source code
+      - ./.env:/app/.env # Mount the .env file for tests to access DB credentials
+    env_file:
+      - .env # Load environment variables for tests
+    environment:
+      # Pass DB connection details to the test environment
+      DB_HOST: postgres-db # Use the service name for the database
+      DB_PORT: ${DB_PORT}
+      DB_NAME: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      GIN_MODE: test # Set Gin mode for tests if needed
+      DB_SSLMODE: ${DB_SSLMODE} # <-- Explicitly pass DB_SSLMODE from .env
+    depends_on:
+      postgres:
+        condition: service_healthy # Ensure DB is healthy before running tests
+    networks:
+      - app-network
+    command: go test ./test -v # Command to run your tests
+    restart: "no"
 
 volumes:
   postgres-data:
